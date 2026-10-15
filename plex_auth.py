@@ -99,6 +99,7 @@ class PlexSignIn:
         self.client_id = data['client_id']
         self.token = data.get('account_token')
         self.name = data.get('name', '')
+        self.account_id = data.get('account_id', self.client_id)
         self.connection = data.get('manual')
         self.selected = data.get('selected')
         self.uri = data.get('uri')
@@ -110,7 +111,7 @@ class PlexSignIn:
         data = {'client_id':self.client_id}
         if self.remember:
             if self.token:
-                data.update(account_token=self.token, name=self.name, selected=self.selected, uri=self.uri)
+                data.update(account_token=self.token, name=self.name, account_id=self.account_id, selected=self.selected, uri=self.uri)
             elif self.connection:
                 data['manual'] = self.connection
         self.store.save(self.sid, data)
@@ -146,6 +147,7 @@ class PlexSignIn:
         self.token, self.servers = token, servers
         self.remember = pin['remember']
         self.name = user.get('friendlyName') or user.get('username') or 'Plex viewer'
+        self.account_id = str(user.get('id') or self.client_id)
         self.connection = self.selected = self.uri = self.pending = None
         self.save()
         return self.summary()
@@ -155,6 +157,10 @@ class PlexSignIn:
     async def resume(self):
         if self.token:
             self.servers = await self.resources(self.token)
+            if self.account_id == self.client_id:
+                user = await cloud('GET', '/user', self.client_id, self.token)
+                self.account_id = str(user.get('id') or self.client_id)
+                self.save()
             return self.summary()
         return None
     def summary(self):
@@ -185,5 +191,5 @@ class PlexSignIn:
             self.connection = candidate
             self.selected, self.uri = server_id, endpoint['uri']
             self.save()
-            return {'type':'connected', 'name':server.get('name','Plex server')}
-        raise ValueError('Cannot reach this server. Try another connection or the manual setup.')
+            return {'type':'connected', 'name':server.get('name','Plex server'), 'machine':candidate['machine']}
+        raise ValueError('Cannot reach this server. Try another connection from Your Plex server.')

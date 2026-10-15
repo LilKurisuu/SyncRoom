@@ -1,6 +1,7 @@
 """SyncRoom: ephemeral rooms and per-participant Plex connections."""
 import asyncio
 import math
+import hashlib
 import os
 import secrets
 import time
@@ -30,19 +31,40 @@ async def plex(session, path):
             return ET.fromstring(body)
 
 class Rooms:
-    def __init__(self, store):
+    def __init__(self, store, reconnect_grace=20):
         self.rooms = {}
         self.store = store
         self.sockets = {}
+        self.reconnect_grace = reconnect_grace
+        self.cleanup_tasks = set()
+        self.intentional_disconnects = set()
+
+    @staticmethod
+    def account_key(account):
+        return hashlib.sha256(account.encode()).hexdigest()[:24]
+
+    def is_host(self, room, identity):
+        return bool(room and identity in room['members'] and room['host'] in room['members'] and
+                    room['members'][identity]['account'] == room['members'][room['host']]['account'])
 
     async def broadcast(self, room):
-        state = {k: v for k, v in room.items() if k != 'members'}
-        state['type'] = 'state'
-        state['serverTime'] = time.time()
-        state['members'] = [{'id': k, 'name': v['name']} for k, v in room['members'].items()]
+        groups = {}
+        host_account = room['members'][room['host']]['account']
+        for member in room['members'].values():
+            key = self.account_key(member['account'])
+            group = groups.setdefault(key, {'id':key, 'name':member['name'], 'tabs':0, 'online':False})
+            if member['ws'] is not None and not member['ws'].closed:
+                group['tabs'] += 1
+                group['online'] = True
+        state = {k:v for k,v in room.items() if k not in ('members','host')}
+        state.update(type='state', host=self.account_key(host_account), serverTime=time.time(),
+                     members=sorted(groups.values(), key=lambda m:(m['id'] != self.account_key(host_account),m['name'].casefold())))
         for member in list(room['members'].values()):
-            if not member['ws'].closed:
-                await member['ws'].send_json(state)
+            if member['ws'] is not None and not member['ws'].closed:
+                try:
+                    await member['ws'].send_json(dict(state, self=self.account_key(member['account'])))
+                except ConnectionResetError:
+                    pass
 
     async def websocket(self, request):
         origin = request.headers.get('Origin')
@@ -64,11 +86,13 @@ class Rooms:
             async for message in ws:
                 if message.type != WSMsgType.TEXT:
                     continue
+                action = None
                 try:
                     data = message.json()
                     action = data.get('type')
                     if self.store.get(sid) is None:
                         await ws.send_json({'type':'auth_signed_out', 'message':'Session expired. Reload and sign in again.'})
+                        self.intentional_disconnects.add(ws)
                         await ws.close()
                         break
                     if action == 'auth_start':
@@ -80,7 +104,7 @@ class Rooms:
                         if result:
                             await ws.send_json(result)
                         elif auth.connection:
-                            await ws.send_json({'type':'connected'})
+                            await ws.send_json({'type':'connected', 'machine':auth.connection['machine']})
                         else:
                             await ws.send_json({'type':'auth_guest'})
                     elif action == 'auth_select':
@@ -90,6 +114,7 @@ class Rooms:
                         await ws.send_json({'type':'auth_cancelled'})
                     elif action == 'auth_signout':
                         self.store.delete(sid)
+                        self.intentional_disconnects.update(self.sockets.get(sid, ()))
                         for peer in list(self.sockets.get(sid, ())):
                             await peer.send_json({'type':'auth_signed_out'})
                             await peer.close()
@@ -121,24 +146,35 @@ class Rooms:
                         if not auth.token or not auth.name:
                             raise ValueError('Sign in with Plex before creating or joining a room.')
                         if room:
-                            raise ValueError('Leave your current room first.')
+                            if action == 'create' or str(data.get('code','')).strip().upper() == room['code']:
+                                await self.broadcast(room)
+                                continue
+                            raise ValueError('Leave your current room before joining another.')
                         if action == 'create':
                             if len(self.rooms) >= 100:
                                 raise ValueError('Room limit reached.')
                             code = secrets.token_hex(4).upper()
+                            while code in self.rooms:
+                                code = secrets.token_hex(4).upper()
                             room = {'code': code, 'host': identity, 'media': None, 'playing': False, 'position': 0, 'updated': time.time(), 'members': {}}
                             self.rooms[code] = room
                         else:
                             room = self.rooms.get(str(data.get('code', '')).strip().upper())
                             if not room:
                                 raise ValueError('Room not found.')
-                            if len(room['members']) >= 12:
+                            accounts = {m['account'] for m in room['members'].values()}
+                            if len(room['members']) >= 36 or (auth.account_id not in accounts and len(accounts) >= 12):
                                 room = None
                                 raise ValueError('Room is full.')
-                        room['members'][identity] = {'ws': ws, 'name': auth.name[:64]}
+                        for previous, member in list(room['members'].items()):
+                            if member['account'] == auth.account_id and member['ws'] is None:
+                                room['members'].pop(previous)
+                                if room['host'] == previous:
+                                    room['host'] = identity
+                        room['members'][identity] = {'ws':ws, 'name':auth.name[:64], 'account':auth.account_id}
                         await self.broadcast(room)
                     elif action in ('select', 'playback'):
-                        if not room or room['host'] != identity:
+                        if not self.is_host(room, identity):
                             raise ValueError('Only the host can control playback.')
                         if action == 'select':
                             if not auth.connection:
@@ -172,10 +208,10 @@ class Rooms:
                             raise ValueError('No playable media part found.')
                         # Credentials go only to their owning browser, never into shared room state.
                         from urllib.parse import quote
-                        await ws.send_json({'type': 'stream', 'id': media['id'], 'url': auth.connection['url'] + part.get('key') + '?X-Plex-Token=' + quote(auth.connection['token'], safe='')})
+                        await ws.send_json({'type': 'stream', 'id': media['id'], 'machine':media['machine'], 'url': auth.connection['url'] + part.get('key') + '?X-Plex-Token=' + quote(auth.connection['token'], safe='')})
                     elif action == 'leave':
                         if room:
-                            await self.leave(room, identity)
+                            await self.leave(room, identity, intentional=True)
                             room = None
                         await ws.send_json({'type': 'left'})
                     else:
@@ -183,31 +219,54 @@ class Rooms:
                 except SignInExpired as error:
                     auth.clear()
                     if room:
-                        await self.leave(room, identity)
+                        await self.leave(room, identity, intentional=True)
                         room = None
                         await ws.send_json({'type':'left'})
                     await ws.send_json({'type':'auth_error', 'message':str(error)})
                 except ValueError as error:
-                    await ws.send_json({'type': 'error', 'message': str(error)[:200]})
+                    await ws.send_json({'type': 'error', 'action':action, 'message': str(error)[:200]})
                 except (TypeError, KeyError, AttributeError, ET.ParseError):
-                    await ws.send_json({'type': 'error', 'message': 'Invalid request or Plex response.'})
+                    await ws.send_json({'type': 'error', 'action':action, 'message': 'Invalid request or Plex response.'})
                 except (asyncio.TimeoutError, OSError, ClientError):
-                    await ws.send_json({'type': 'error', 'message': 'Plex is unreachable. Check your network connection.'})
+                    await ws.send_json({'type': 'error', 'action':action, 'message': 'Plex is unreachable. Check your network connection.'})
         finally:
             self.sockets.get(sid, set()).discard(ws)
             if not self.sockets.get(sid):
                 self.sockets.pop(sid, None)
+            intentional = ws in self.intentional_disconnects
+            self.intentional_disconnects.discard(ws)
             if room:
-                await self.leave(room, identity)
+                await self.leave(room, identity, intentional=intentional)
         return ws
 
-    async def leave(self, room, identity):
+    async def leave(self, room, identity, intentional=False):
+        member = room['members'].get(identity)
+        if not member:
+            return
+        same_account = [key for key,m in room['members'].items() if key != identity and
+                        m['account'] == member['account'] and m['ws'] is not None and not m['ws'].closed]
+        if not intentional and not same_account:
+            member['ws'] = None
+            async def expire():
+                await asyncio.sleep(self.reconnect_grace)
+                if room['members'].get(identity) is member and member['ws'] is None:
+                    await self.remove_member(room, identity)
+            task = asyncio.create_task(expire())
+            self.cleanup_tasks.add(task)
+            task.add_done_callback(self.cleanup_tasks.discard)
+            await self.broadcast(room)
+        else:
+            await self.remove_member(room, identity, same_account)
+
+    async def remove_member(self, room, identity, preferred=()):
         room['members'].pop(identity, None)
         if not room['members']:
-            self.rooms.pop(room['code'], None)
+            if self.rooms.get(room['code']) is room:
+                self.rooms.pop(room['code'], None)
         else:
             if room['host'] == identity:
-                room['host'] = next(iter(room['members']))
+                active = [key for key,m in room['members'].items() if m['ws'] is not None and not m['ws'].closed]
+                room['host'] = next(iter(preferred or active or room['members']))
             await self.broadcast(room)
 
 
@@ -224,15 +283,18 @@ async def index(request):
     response.headers['X-Frame-Options'] = 'DENY'
     return response
 
-def create_app(data_dir=None):
+def create_app(data_dir=None, reconnect_grace=20):
     app = web.Application(client_max_size=8192)
     store = SessionStore(data_dir or os.getenv('SYNCROOM_DATA_DIR', 'data'))
-    rooms = Rooms(store)
+    rooms = Rooms(store, reconnect_grace)
     app[STORE], app[ROOMS] = store, rooms
     async def cleanup(app):
         for peers in list(rooms.sockets.values()):
             for ws in list(peers):
                 await ws.close(code=1001, message=b'Server restarting')
+        for task in list(rooms.cleanup_tasks):
+            task.cancel()
+        await asyncio.gather(*rooms.cleanup_tasks, return_exceptions=True)
         store.close()
     app.on_shutdown.append(cleanup)
     app.router.add_get('/ws', rooms.websocket)

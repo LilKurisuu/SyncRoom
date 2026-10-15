@@ -1,4 +1,4 @@
-# SyncRoom v0.2
+# SyncRoom v0.3
 
 Self-hosted Plex watch rooms with a Nocturne-inspired black-and-white interface. Python/aiohttp, WebSockets and plain HTML/CSS/JavaScript. Newly authored from the original chat requirements, not a recovered archive. Original Nocturne design files were unavailable.
 
@@ -21,7 +21,7 @@ python app.py
 
 ## Watch together
 
-1. Click **Sign in with Plex** and approve SyncRoom on Plex’s website. Your Plex display name becomes your room name automatically.
+1. Click **Sign in with Plex** and approve SyncRoom on Plex’s website. Your Plex display name becomes your participant name automatically.
 2. Create a room and share the code or invite; your friends sign in with Plex, then join using that code. A sole available server connects automatically; use Your Plex server to choose when there are several. Everyone should select the same server.
 3. The host opens a movie library and selects a movie.
 4. The host controls play, pause and seeking. Guests follow. Click Enable playback if autoplay is blocked.
@@ -57,14 +57,17 @@ For updates, rebuild/recreate the container while preserving `/data`; never run 
 
 ## Implemented
 
-- Random room codes, participants, host handoff and empty-room cleanup.
+- Dedicated room header, shareable invites, participant avatars and host badges.
+- One participant per Plex account, with a count for multiple tabs. Host controls work across that account’s tabs.
+- Refresh and invite links rejoin automatically after sign-in. A disconnected account has 20 seconds to reconnect before removal and host handoff. Leaving explicitly takes effect immediately.
+- Random room codes, host handoff and empty-room cleanup.
 - Host-only playback commands, late-join state and periodic drift correction.
 - Plex hosted sign-in, remembered sessions, account display names, account server discovery, movie browsing and per-viewer direct playback.
 - Responsive monochrome interface, Docker/Compose, MIT license and GitHub Actions.
 
 ## Limits
 
-Use on a trusted LAN or private VPN. No room passwords or automatic room reconnect. Plex sign-in is required to create or join rooms; the room code grants access to an existing room. Room codes grant entry. The Plex URL feature permits private network destinations for self-hosting and can make requests from the server network; do not expose it to untrusted users.
+Use on a trusted LAN or private VPN. No room passwords. Plex sign-in is required to create or join rooms; the room code grants access to an existing room. The Plex URL feature permits private network destinations for self-hosting and can make requests from the server network; do not expose it to untrusted users.
 
 Browser-compatible media only (commonly MP4/H.264/AAC). No transcoding, subtitles, alternate audio selection, TV-season browsing or Jellyfin yet. Movie libraries are the supported browsing path. Everyone needs access to the same media on the same Plex server. Synchronization is approximate; buffering and latency can produce drift.
 
