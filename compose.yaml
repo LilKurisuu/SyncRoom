@@ -1,9 +1,14 @@
 services:
   syncroom:
+    image: syncroom:local
     build: .
+    environment:
+      SYNCROOM_SECURE_COOKIE: "${SYNCROOM_SECURE_COOKIE:-0}"
     ports:
       - "8765:8765"
     restart: unless-stopped
+    volumes:
+      - syncroom-data:/data
     read_only: true
     tmpfs:
       - /tmp
@@ -11,3 +16,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  syncroom-data:

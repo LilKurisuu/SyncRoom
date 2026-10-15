@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
+data/
+*.sqlite3*
+*.key

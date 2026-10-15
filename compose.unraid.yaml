@@ -1,0 +1,9 @@
+# Overlay for a standard Unraid host: persist encrypted logins in appdata.
+# Prepare the directory as described in README before starting.
+services:
+  syncroom:
+    user: "99:100"
+    volumes:
+      - type: bind
+        source: ${SYNCROOM_APPDATA:-/mnt/user/appdata/syncroom}
+        target: /data
