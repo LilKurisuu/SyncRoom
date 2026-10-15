@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from aiohttp import CookieJar
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 from aiohttp.test_utils import TestClient, TestServer
@@ -6,17 +8,31 @@ from app import create_app
 
 class Integration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.client = TestClient(TestServer(create_app()))
+        self.directory = tempfile.TemporaryDirectory()
+        self.client = TestClient(TestServer(create_app(self.directory.name)), cookie_jar=CookieJar(unsafe=True))
         await self.client.start_server()
+        await self.client.get('/')
         self.sockets = []
     async def asyncTearDown(self):
         for ws in self.sockets:
             await ws.close()
         await self.client.close()
+        self.directory.cleanup()
     async def connect(self):
         ws = await self.client.ws_connect('/ws')
         self.sockets.append(ws)
-        return ws, (await ws.receive_json())['id']
+        identity = (await ws.receive_json())['id']
+        self.assertEqual((await ws.receive_json())['type'], 'auth_ready')
+        async def fake_auth(method, path, client_id, token=None, params=None):
+            if path == '/pins': return {'id':123, 'code':'fixture-code', 'expiresIn':600}
+            if path == '/pins/123': return {'authToken':'account-fixture-value'}
+            if path == '/user': return {'username':'Plex viewer'}
+            if path == '/resources': return [{'provides':'server','clientIdentifier':'test-server','name':'Test server','accessToken':'fixture-value','connections':[{'uri':'http://plex:32400','local':True}]}]
+            raise AssertionError(path)
+        with patch('plex_auth.cloud', fake_auth):
+            self.assertEqual((await self.command(ws, {'type':'auth_start','remember':False}))['type'], 'auth_started')
+            self.assertEqual((await self.command(ws, {'type':'auth_check'}))['type'], 'auth_signed_in')
+        return ws, identity
     async def command(self, ws, data):
         await ws.send_json(data)
         return await ws.receive_json(timeout=3)
@@ -25,6 +41,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         guest, guest_id = await self.connect()
         created = await self.command(host, {'type':'create','name':'Host'})
         self.assertEqual(created['host'], host_id)
+        self.assertEqual(created['members'][0]['name'], 'Plex viewer')
         joined = await self.command(guest, {'type':'join','code':created['code'],'name':'Guest'})
         await host.receive_json()
         self.assertEqual(len(joined['members']), 2)
@@ -51,7 +68,7 @@ class Integration(unittest.IsolatedAsyncioTestCase):
             host, _ = await self.connect()
             guest, _ = await self.connect()
             for ws in (host, guest):
-                self.assertEqual((await self.command(ws, {'type':'connect','url':'http://plex:32400','token':'fixture-value'}))['type'], 'connected')
+                self.assertEqual((await self.command(ws, {'type':'auth_select','id':'test-server','uri':'http://plex:32400'}))['type'], 'connected')
             created = await self.command(host, {'type':'create'})
             await self.command(guest, {'type':'join','code':created['code']})
             await host.receive_json()
